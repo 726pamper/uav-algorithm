@@ -1,0 +1,3 @@
+# 启动配置（bootstrap）—— 仅指定当前激活的 profile
+# 切换环境只需改这一个值：main（生产）或 test（测试）
+profile: main

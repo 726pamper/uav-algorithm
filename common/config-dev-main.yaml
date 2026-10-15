@@ -1,0 +1,39 @@
+# Minio
+minio:
+  endpoint: "127.0.0.1:9000"
+  access_key: "minioadmin"
+  secret_key: "minioadmin"
+  secure: false # 启用 https
+
+# EMQX
+mqtt:
+  host: '127.0.0.1'
+  port: 1883
+  username: "mqtt_user"
+  password: "change_me"
+  clientid: "uav_algorithm_control"
+  topics:
+    # 控制算法开启关闭
+    algorithm_control: "ai/calculate/event"
+    # 控制同步数据
+    data_sync: "ai/calculate/event"
+    # 图片模式：平台无人机手动拍照上报主题
+    photo_notify: "ai/calculate/control/photo"
+    # 图片模式：推理终态反馈主题（算法→后端）
+    photo_result: "ai/calculate/photo_result"
+
+# 图片模式（MinIO 图片检测，替代 DeepStream RTSP 拉流）
+image:
+  enabled: true
+
+# Redis
+redis:
+  host: 127.0.0.1
+  port: 6379
+  password: change_me
+  database: 1
+
+# 日志配置
+logging:
+  level: "INFO"
+  file: "inference_service.log"

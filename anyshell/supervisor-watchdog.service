@@ -1,0 +1,10 @@
+[Unit]
+Description=Supervisor container health check
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/path/to/TensorRT/uav-algorithm-pipeline/anyshell/check_supervisor_container.sh
+SuccessExitStatus=0 4
+

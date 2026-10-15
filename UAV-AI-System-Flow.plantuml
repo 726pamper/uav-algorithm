@@ -1,0 +1,152 @@
+@startuml UAV-AI-System-Flow
+' ============================================================
+' UAV AI 算法推理管道 — 完整数据流
+' 算法路径 + LLM路径
+' ============================================================
+
+skinparam backgroundColor #FEFEFE
+skinparam sequenceMessageAlign center
+skinparam BoxPadding 10
+skinparam ParticipantPadding 20
+skinparam NoteBackgroundColor #F5F5F5
+skinparam NoteBorderColor #CCCCCC
+
+title UAV AI 算法推理管道 — 完整链路（算法路径 + LLM路径）
+
+actor "平台\n(MQTT)" as Platform
+
+box "主控层" #E8F0FE
+    participant "mqtt_redis.py\n编排主控" as Orchestrator
+end box
+
+box "推理层" #E8F5E9
+    participant "deepstream_trt_inference.py\n推理子进程" as Inference
+    participant "LLM API\n(DashScope)" as LLM_API
+end box
+
+box "消息/存储层" #FFF3E0
+    participant "Redis\n消息总线" as Redis
+    participant "MinIO\n对象存储" as MinIO
+end box
+
+box "消费层" #F3E5F5
+    participant "redis_result_processor.py\n结果处理器" as Processor
+end box
+
+== 1. 服务启动 ==
+
+Platform -> Orchestrator : handshake_auth_reply (握手认证)
+Orchestrator -> Platform : handshake_auth_reply (认证应答)
+
+Platform -> Orchestrator : serve_start\n(RTSP/RTMP, 算法列表, LLM配置)
+Orchestrator -> Redis : setex inference:task:{task_id}\n(任务快照)
+Orchestrator -> Inference : multiprocessing.Process\n(spawn 子进程)
+
+Inference -> Inference : 加载 TensorRT 引擎\n初始化 MODEL_DICT
+Inference -> Redis : subscribe {task_id}\n(等待算法列表)
+
+Orchestrator -> Redis : publish {task_id}\nstart_algorithm_list / start_llm_list
+Redis -> Inference : 接收算法列表，启动推理
+
+== 2. 算法推理路径 (Path A) ==
+
+group 帧推理循环
+    Inference -> Inference : 帧计数器 + 帧跳过判断\nprobe 回调触发
+    Inference -> Inference : GPU 推理 (TensorRT)\n按 GPU 分组并行
+
+    Inference -> Inference : fast_upload_to_redis()
+    note right
+        **encode_with_detection_info()**
+        为每个检测项写入 model_code
+        --
+        **build_detect_frame_from_detections()**
+        按算法分组 en_names/cn_names
+        boxes 含 method + cn_name + points
+    end note
+
+    Inference -> Redis : setex image:{task_id}:{ts}\n(JPEG bytes, TTL 600s)
+    Inference -> Redis : setex metadata:{task_id}:{ts}\n(含 detections, detect_frame, TASK)
+    Inference -> Redis : publish "alarm-images"\n(metadata_key)
+end
+
+Redis -> Processor : subscribe "alarm-images"\n接收 metadata_key
+
+Processor -> Redis : GET metadata_key\n(获取完整 JSON)
+
+Processor -> Processor : _process_message()
+note right
+    TASK != 'llm' → 走算法路径
+    algorithmnum 为 list 且长度>1
+    → _process_multi_algorithm()
+    否则
+    → _process_single_algorithm()
+end note
+
+Processor -> Processor : detect() → draw()\n(ALGO_REGISTRY 路由)
+
+Processor -> Processor : _save_result()
+Processor -> MinIO : 上传 告警图 + 原图\n(object_key, raw_object_key)
+
+Processor -> Platform : publish "ai/calculate/event"\ndefinition=ai-event\n(含 detect_frame, model_code, classes, xy)
+
+== 3. LLM 推理路径 (Path B) ==
+
+group 每 60 帧触发一次
+    Inference -> Inference : probe 回调\nLLM_PROMPT 配置检查
+    Inference -> Inference : LLM_THREAD_POOL.submit(\n  _request_llm_and_upload)
+
+    Inference -> Inference : img RGBA→BGR→JPEG→base64\n→ data:image/jpeg;base64,...
+
+    Inference -> LLM_API : realtime_llm_infer()\n(多模态识别请求)
+    LLM_API -> Inference : 返回 JSON 结果\n(含 bbox_2d, label)
+
+    Inference -> Inference : llm_upload_to_redis()
+    note right
+        **parse_llm_objects_for_detect_frame()**
+        解析 LLM 返回的坐标
+        height, width = img_array.shape[:2]
+        归一化→像素坐标反算
+        构建 detect_frame
+    end note
+
+    Inference -> Redis : setex image:{task_id}:{ts}\n(JPEG bytes)
+    Inference -> Redis : setex metadata:{task_id}:{ts}\n(含 TASK='llm', llm_result, prompt, detect_frame)
+    Inference -> Redis : publish "alarm-images"\n(metadata_key)
+end
+
+Redis -> Processor : subscribe "alarm-images"\n接收 metadata_key
+
+Processor -> Redis : GET metadata_key\n(获取完整 JSON)
+
+Processor -> Processor : _process_message()
+note right
+    TASK == 'llm' → 走 LLM 路径
+    → _process_llm_result()
+end note
+
+Processor -> Processor : realtime_parse_llm_output()\n(解析 LLM 返回的 JSON)
+Processor -> Processor : ALGO_REGISTRY['llm']['draw']()\n(LLM 可视化绘制)
+
+Processor -> MinIO : 上传 告警图 + 原图\n(object_key, raw_object_key)
+
+Processor -> Platform : publish "ai/calculate/event"\ndefinition=ai-event\n(含 prompt, detect_frame, xy)
+
+== 4. 关键差异对比 ==
+
+note over Platform, Processor
+  **算法路径 vs LLM路径**
+  ┌──────────────┬─────────────────────┬─────────────────────┐
+  │ 对比点        │ 算法路径 (Path A)     │ LLM路径 (Path B)    │
+  ├──────────────┼─────────────────────┼─────────────────────┤
+  │ 触发函数       │ fast_upload_to_redis│ llm_upload_to_redis │
+  │ metadata TASK│ detect/obb/segment  │ "llm"               │
+  │ detect 处理   │ ALGO_REGISTRY detect│ realtime_parse_llm  │
+  │ draw 处理     │ ALGO_REGISTRY draw  │ ALGO_REGISTRY['llm']│
+  │ detect_frame │ build_detect_frame  │ parse_llm_objects   │
+  │ 构造者        │ from_detections     │ for_detect_frame    │
+  │ points 格式   │ [{"X":x,"Y":y},...] │ [{"X":x,"Y":y},...] │
+  │ model_code   │ 算法编号 (如 "75")    │ "llm"               │
+  └──────────────┴─────────────────────┴─────────────────────┘
+end note
+
+@enduml
